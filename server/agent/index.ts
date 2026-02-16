@@ -1,78 +1,111 @@
-import { generateText, CoreMessage } from 'ai';
+import { generateText, ModelMessage, TypedToolCall } from 'ai';
 import { google } from '@ai-sdk/google';
 import { Expense } from './types';
 import { SYSTEM_PROMPT } from './systemPrompt';
-import { createTools } from '../tools';
+import { FILTER_RESULT_LIMIT, tools } from '../tools/schemas';
+import { toolFunctions } from '../tools/registry';
+import { deepDelete, sleep } from '../utils/general';
+
+const MAX_STEPS = 3;
+type ToolName = keyof typeof toolFunctions;
 
 export class FinanceAgent {
+  private agentMemory: ModelMessage[];
   private expenses: Expense[];
-  private messages: CoreMessage[] = [
-    { role: 'system', content: SYSTEM_PROMPT },
-  ];
 
   constructor(expenses: Expense[]) {
+    this.agentMemory = [
+      {
+        role: 'system',
+        content: SYSTEM_PROMPT,
+      }
+    ];
+
     this.expenses = expenses;
   }
 
-  async run(query: string): Promise<string> {
-    console.log("Running agent with query:", query);
-
-    return "test";
-    this.messages.push({ role: 'user', content: query });
-    const tools = createTools(this.expenses);
-
-    let steps = 0;
-    const maxSteps = 10;
-
-    while (steps < maxSteps) {
-      const result = await generateText({
-        model: google('gemini-2.5-flash'),
-        messages: this.messages as any, // Cast to avoid strict type issues while debugging
-        tools,
-      });
-
-      if (result.finishReason === 'tool-calls') {
-        const toolCalls = result.toolCalls;
-
-        // Add model's tool calls to messages
-        this.messages.push({
-          role: 'assistant',
-          content: toolCalls.map(tc => ({
-            type: 'tool-call',
-            toolCallId: tc.toolCallId,
-            toolName: tc.toolName,
-            args: tc.args,
-          })),
-        } as any);
-
-        // Execute tools and add results to messages
-        for (const toolCall of toolCalls) {
-          const tool = (tools as any)[toolCall.toolName];
-          if (tool) {
-            const toolResult = await tool.execute(toolCall.args);
-            this.messages.push({
-              role: 'tool',
-              content: [
-                {
-                  type: 'tool-result',
-                  toolCallId: toolCall.toolCallId,
-                  toolName: toolCall.toolName,
-                  result: toolResult,
-                },
-              ],
-            } as any);
-          }
-        }
-        steps++;
-        continue;
-      }
-
-      // Finish reason is 'stop' or similar
-      const responseText = result.text;
-      this.messages.push({ role: 'assistant', content: responseText });
-      return responseText;
+  private addToMemory(toolCallId: string, toolName: string, result: any): void {
+    let truncatedResult = result;
+    if (toolName === 'filter_expenses') {
+      truncatedResult = {
+        filteredCount: result.metadata.totalMatching,
+        firstFew: result.expenses.slice(0, FILTER_RESULT_LIMIT),
+        note: "Note: this result has been truncated to save context.",
+      };
     }
 
-    return "I'm sorry, I reached my maximum processing limit for this request.";
+    this.agentMemory.push({
+      role: 'tool',
+      content: [
+        {
+          type: 'tool-result',
+          toolCallId,
+          toolName,
+          output: { type: 'json' as const, value: JSON.stringify(truncatedResult) },
+        },
+      ],
+    });
+  }
+
+  private async handleToolCall(toolCall: TypedToolCall<typeof tools>): Promise<void> {
+    const toolName = toolCall.toolName as ToolName;
+    const toolFn = toolFunctions[toolName];
+
+    if (!toolFn) {
+      this.addToMemory(
+        toolCall.toolCallId,
+        toolCall.toolName,
+        { error: `Unknown tool: ${toolCall.toolName}` }
+      );
+      return;
+    }
+
+    try {
+      console.log('Calling tool', toolCall.toolName, 'with input', toolCall.input);
+      const toolResult = await toolFn(this.expenses, toolCall.input as never);
+      this.addToMemory(toolCall.toolCallId, toolCall.toolName, toolResult);
+    } catch (error) {
+      this.addToMemory(
+        toolCall.toolCallId,
+        toolCall.toolName,
+        { error: error instanceof Error ? error.message : 'Tool execution failed' }
+      );
+    }
+  }
+
+  /* We could have passed the tools with their function logic directly to the model and let it all run independently,
+  but then we would lose control of the ability to easily trace and log the flow, which makes debugging harder */
+  async run(query: string): Promise<string> {
+    this.agentMemory.push({
+      role: 'user',
+      content: query,
+    });
+
+    let step = 0;
+    while (step < MAX_STEPS) {
+      const result = await generateText({
+        model: google('gemini-2.5-flash'),
+        messages: this.agentMemory,
+        tools,
+        temperature: 0.1,
+      });
+
+      deepDelete(result.response.messages, 'providerOptions'); // Remove providerOptions to avoid cluttering the memory with the thoughtSignature
+      this.agentMemory.push(...result.response.messages);
+
+      if (result.finishReason === 'tool-calls') {
+        for (const toolCall of result.toolCalls) {
+          await this.handleToolCall(toolCall);
+        }
+      } else {
+        return result.text;
+      }
+
+      step++;
+      await sleep(1_000);
+    }
+
+
+    return 'Agent reached maximum steps without completing the task.';
   }
 }
